@@ -1,0 +1,715 @@
+import streamlit as st
+import pandas as pd
+import os
+import re
+from collections import Counter
+
+# ==========================================
+# 1. PAGE CONFIG & CUSTOM CSS (Sky Blue Theme)
+# ==========================================
+st.set_page_config(
+    page_title="THAI AI PROFESSIONAL v8.0 - Complete Backtest",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700;800&display=swap');
+    html, body, [class*="css"] { font-family: 'Sarabun', sans-serif; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    .report-card {
+        background-color: #f0f9ff;
+        border-left: 5px solid #0284c7;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+VERSION = "THAI AI PROFESSIONAL v8.0 - Formula Detail & Backtest Engine"
+
+# ==========================================
+# 2. SESSION STATE & DAILY NUMBERS
+# ==========================================
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "uploaded_csvs" not in st.session_state:
+    st.session_state.uploaded_csvs = {}
+if "target_number" not in st.session_state:
+    st.session_state.target_number = "423224"
+if "target_number_input" not in st.session_state:
+    st.session_state.target_number_input = st.session_state.target_number
+if "ai_settings" not in st.session_state:
+    st.session_state.ai_settings = {
+        "formula_weight": 1.00,
+        "cross_weight": 0.90,
+        "daily_weight": 1.50,
+        "echo_weight": 0.70,
+        "recovery_weight": 0.60,
+    }
+
+DAILY_NUMBERS = {
+    "Monday": "462793",
+    "Tuesday": "639170",
+    "Wednesday": "257308",
+    "Thursday": "176904",
+    "Friday": "730259",
+    "Saturday": "895260",
+    "Sunday": "062341",
+}
+
+VERSION = "THAI AI PROFESSIONAL v8.0 - Formula Detail & Backtest Engine"
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+CSV_FILES = {
+    "Monday": "thai_lottery_monday_history.csv",
+    "Tuesday": "thai_lottery_tuesday_history.csv",
+    "Wednesday": "thai_lottery_wednesday_history.csv",
+    "Thursday": "thai_lottery_thursday_history.csv",
+    "Friday": "thai_lottery_friday_history.csv",
+    "Saturday": "thai_lottery_saturday_history.csv",
+    "Sunday": "thai_lottery_sunday_history.csv",
+}
+CSV_COLUMNS = [
+    "date_be", "first_prize", "last_2_digits",
+    "front_3_1", "front_3_2", "last_3_1", "last_3_2"
+]
+
+# ==========================================
+# 3. CSV LOADER / DATE HANDLING
+# ==========================================
+def parse_be_date(value):
+    """Convert DD/MM/YYYY (B.E. or C.E.) to sortable YYYYMMDD integer."""
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+    if not match:
+        return None
+    day, month, year = map(int, match.groups())
+    if year >= 2400:
+        year -= 543
+    try:
+        return year * 10000 + month * 100 + day
+    except Exception:
+        return None
+
+def normalize_history_dataframe(df, day_name):
+    """Accept both original CSV column names and the older session aliases."""
+    records = []
+    for _, row in df.iterrows():
+        date_value = row.get("date_be", row.get("date", ""))
+        first_value = row.get("first_prize", row.get("first", ""))
+        back2_value = row.get("last_2_digits", row.get("back2", ""))
+
+        first_digits = safe_digits(first_value)
+        back2_digits = safe_digits(back2_value)
+
+        if not first_digits or not back2_digits:
+            continue
+
+        records.append({
+            "date": str(date_value).strip(),
+            "day": day_name,
+            "first": first_digits.zfill(6)[-6:],
+            "back2": back2_digits.zfill(2)[-2:],
+        })
+
+    # CSVs in this project are generally newest-first.
+    # Sort by parsed date so Backtest can always run oldest-to-newest.
+    if records:
+        records.sort(
+            key=lambda item: (
+                parse_be_date(item["date"]) is None,
+                parse_be_date(item["date"]) or 0
+            )
+        )
+        # If dates could not be parsed, retain the input order by reversing
+        # the newest-first CSV order as a conservative fallback.
+        if all(parse_be_date(item["date"]) is None for item in records):
+            records.reverse()
+    return records
+
+def load_history_by_day(day_name):
+    if day_name in st.session_state.uploaded_csvs:
+        df = st.session_state.uploaded_csvs[day_name]
+    else:
+        filename = CSV_FILES.get(day_name)
+        if not filename or not os.path.exists(filename):
+            return []
+        try:
+            df = pd.read_csv(filename, dtype=str, keep_default_na=False)
+        except Exception as exc:
+            st.error(f"อ่านไฟล์ {filename} ไม่สำเร็จ: {exc}")
+            return []
+    return normalize_history_dataframe(df, day_name)
+
+def save_history_entry(day_name, date_be, first_prize, back2):
+    """Persist a manually entered result to the matching local CSV."""
+    filename = CSV_FILES[day_name]
+    if os.path.exists(filename):
+        df = pd.read_csv(filename, dtype=str, keep_default_na=False)
+    else:
+        df = pd.DataFrame(columns=CSV_COLUMNS)
+
+    # Normalize existing headers to the canonical CSV schema.
+    if "date_be" not in df.columns and "date" in df.columns:
+        df = df.rename(columns={"date": "date_be"})
+    if "first_prize" not in df.columns and "first" in df.columns:
+        df = df.rename(columns={"first": "first_prize"})
+    if "last_2_digits" not in df.columns and "back2" in df.columns:
+        df = df.rename(columns={"back2": "last_2_digits"})
+
+    for col in CSV_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[CSV_COLUMNS]
+
+    if date_be in df["date_be"].astype(str).values:
+        raise ValueError("วันที่นี้มีอยู่ใน CSV แล้ว")
+
+    new_row = {
+        "date_be": date_be,
+        "first_prize": first_prize,
+        "last_2_digits": back2,
+        "front_3_1": "",
+        "front_3_2": "",
+        "last_3_1": "",
+        "last_3_2": "",
+    }
+    df = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+    df.to_csv(filename, index=False, encoding="utf-8-sig")
+    st.session_state.uploaded_csvs.pop(day_name, None)
+
+# ==========================================
+# 4. HELPER FUNCTIONS & ORIGINAL FORMULAS
+# ==========================================
+def safe_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+def safe_digits(value):
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+def format_result(value, mode="back2"):
+    value = safe_digits(value)
+    if mode == "first":
+        return value.zfill(6)[-6:]
+    if mode == "back2":
+        return value.zfill(2)[-2:]
+    if mode == "three":
+        return value.zfill(3)[-3:]
+    return value
+
+def get_target_digits(target, mode="back2"):
+    target = safe_digits(target).zfill(6)[-6:]
+    if mode == "first":
+        return target
+    if mode == "back2":
+        return target[-2:]
+    return target
+
+def calculate_digit_accuracy(prediction, answer):
+    p_counter = Counter(safe_digits(prediction))
+    a_counter = Counter(safe_digits(answer))
+    hit = sum((p_counter & a_counter).values())
+    max_digit = max(len(safe_digits(prediction)), len(safe_digits(answer)))
+    accuracy = (hit / max_digit * 100) if max_digit else 0.0
+    return hit, accuracy
+
+def calculate_score(result, answer):
+    """Legacy-compatible positional score: 50 points per correctly placed digit."""
+    pred = safe_digits(result).zfill(2)[-2:]
+    actual = safe_digits(answer).zfill(2)[-2:]
+    hits = sum(pred[i] == actual[i] for i in range(2))
+    return hits * 50
+
+def formula_cross_multiply(number, mode="back2", daily_number="-"):
+    target = get_target_digits(number, "first")[-4:]
+    d1, d2 = safe_int(target[0]), safe_int(target[1])
+    return format_result(
+        f"{(d1 * d2 + 7) % 10}{(d1 + d2 + 3) % 10}", mode
+    )
+
+def formula1(target, mode="back2", daily_number="-"):
+    digits = get_target_digits(target, "first")
+    total_sum = sum(safe_int(x) for x in digits)
+    return format_result((total_sum * 17 + safe_int(digits[-1]) * 23) % 1000, mode)
+
+def formula2(number, mode="back2", daily_number="-"):
+    a, b, c, d, e, f = map(safe_int, get_target_digits(number, "first"))
+    return format_result((a * b) + (c * d) + (e * f), mode)
+
+def formula3(number, mode="back2", daily_number="-"):
+    return format_result(sum(map(safe_int, get_target_digits(number, "first"))) * 111, mode)
+
+def formula4(number, mode="back2", daily_number="-"):
+    digits = list(map(safe_int, get_target_digits(number, "first")))
+    value = sum(digits[:3]) * sum(digits[3:])
+    return formula5(number, mode, daily_number) if value == 0 else format_result(value, mode)
+
+def formula5(number, mode="back2", daily_number="-"):
+    digits = [safe_int(x) for x in get_target_digits(number, "first")]
+    score = Counter({x: c * 5 for x, c in Counter(digits).items()})
+    for i in range(len(digits) - 1):
+        score[(digits[i] + digits[i + 1]) % 10] += 2
+        score[(digits[i] * digits[i + 1]) % 10] += 2
+        score[abs(digits[i] - digits[i + 1])] += 1
+    ranking = sorted(score.items(), key=lambda x: (-x[1], x[0]))
+    length = {"first": 6, "back2": 2, "three": 3}.get(mode, 2)
+    return "".join(str(d) for d, _ in ranking[:length]).zfill(length)
+
+def formula6(number, mode="back2", daily_number="-"):
+    d = list(map(safe_int, get_target_digits(number, "first")))
+    return format_result((d[0] + d[2] + d[4]) * (d[1] + d[3] + d[5]), mode)
+
+def formula7(number, mode="back2", daily_number="-"):
+    d = list(map(safe_int, get_target_digits(number, "first")))
+    return format_result((d[0] * 10 + d[1]) + (d[4] * 10 + d[5]), mode)
+
+def formula8(number, mode="back2", daily_number="-"):
+    return format_result(sum(map(safe_int, get_target_digits(number, "first"))) * 123, mode)
+
+def formula9(number, mode="back2", daily_number="-"):
+    d = list(map(safe_int, get_target_digits(number, "first")))
+    return format_result(abs((d[0] * 100 + d[1] * 10 + d[2]) - (d[3] * 100 + d[4] * 10 + d[5])), mode)
+
+def formula10(number, mode="back2", daily_number="-"):
+    d = list(map(safe_int, get_target_digits(number, "first")))
+    return format_result((d[0] * d[5]) + (d[1] * d[4]) + (d[2] * d[3]), mode)
+
+def formula11(number, mode="back2", daily_number="-"):
+    d = [safe_int(x) for x in get_target_digits(number, "first")]
+    return format_result((d[0] * d[1] + d[4] * d[5]) % 1000, mode)
+
+def formula12(number, mode="back2", daily_number="-"):
+    d = [safe_int(x) for x in get_target_digits(number, "first")]
+    b = (d[3] + d[4]) % 10
+    return format_result(int(f"{b}{(b + 1) % 10}{(b + 2) % 10}{(b + 3) % 10}"), mode)
+
+def formula13(number, mode="back2", daily_number="-"):
+    d = [safe_int(x) for x in get_target_digits(number, "first")]
+    return format_result((d[0] + d[2] + d[5]) * 9, mode)
+
+def formula14(number, mode="back2", daily_number="-"):
+    first_digits = get_target_digits(number, "first")
+    f = safe_int(first_digits[5]) if len(first_digits) >= 6 else 0
+    return format_result(int(f"{f}{f}{(f + 1) % 10}{(f + 1) % 10}"), mode)
+
+def formula_neighbor(number, mode="back2", daily_number="-"):
+    d = [safe_int(x) for x in get_target_digits(number, "first")]
+    rf = (d[5] - 1) % 10 if len(d) >= 6 else 0
+    rb = (d[3] + 2) % 10 if len(d) >= 4 else 0
+    return format_result(int(f"{rf}{rb}{(rb + 1) % 10}{(rb + 2) % 10}"), mode)
+
+formulas = [
+    ("Formula 1", formula1), ("Formula 2", formula2), ("Formula 3", formula3),
+    ("Formula 4", formula4), ("Formula 5", formula5), ("Formula 6", formula6),
+    ("Formula 7", formula7), ("Formula 8", formula8), ("Formula 9", formula9),
+    ("Formula 10", formula10), ("Formula 11", formula11), ("Formula 12", formula12),
+    ("Formula 13", formula13), ("Formula 14", formula14),
+    ("Formula Neighbor", formula_neighbor), ("Cross Multiply", formula_cross_multiply)
+]
+FORMULAS_15 = [(name, func) for name, func in formulas if name != "Cross Multiply"]
+
+def dynamic_formula_wrapper(func, target, mode="back2", daily_number="-"):
+    target = safe_digits(target).zfill(6)[-6:]
+    length = {"first": 6, "back2": 2, "three": 3}.get(mode, 2)
+
+    if daily_number and daily_number != "-":
+        daily_digits = safe_digits(daily_number)
+        if daily_digits:
+            target = "".join(
+                str((safe_int(target[i]) + safe_int(daily_digits[i % len(daily_digits)])) % 10)
+                for i in range(6)
+            )
+
+    result = func(target, mode, daily_number)
+    return safe_digits(result).zfill(length)[-length:]
+
+def analyse_all_15_formulas(target_number, daily_number="-", mode="back2"):
+    rows, combined_digits = [], []
+    for name, func in FORMULAS_15:
+        raw_result = dynamic_formula_wrapper(func, target_number, mode, "-")
+        blended_result = dynamic_formula_wrapper(func, target_number, mode, daily_number)
+        rows.append({
+            "สูตร": name,
+            "เลขดิบ": raw_result,
+            "เลขผสมวัน": blended_result,
+            "ท้าย 2 ตัว": blended_result[-2:],
+        })
+        combined_digits.extend(safe_digits(blended_result))
+
+    raw_counts = Counter(combined_digits)
+    counts = {str(d): raw_counts.get(str(d), 0) for d in range(10)}
+    frequency = sorted(counts.items(), key=lambda item: (-item[1], int(item[0])))
+    return rows, frequency, len(combined_digits)
+
+def build_formula_detail_rows(target_number, daily_number):
+    rows = []
+    for name, func in FORMULAS_15:
+        raw = dynamic_formula_wrapper(func, target_number, "three", "-")
+        blended = dynamic_formula_wrapper(func, target_number, "three", daily_number)
+        rows.append({
+            "Formula": name,
+            "Raw": raw,
+            "Blended": blended,
+            "Back2": blended[-2:],
+        })
+    return rows
+
+def run_backtest_analysis(day_name, history, daily_number):
+    """
+    Walk-forward backtest.
+    Input history may be newest-first; loader normalizes it oldest-first.
+    Each previous draw's first prize predicts the next draw's 2-digit result.
+    """
+    if len(history) < 2:
+        return pd.DataFrame(), pd.DataFrame(), 0
+
+    rows = []
+    test_rows = []
+    for name, func in formulas:
+        weight = (
+            st.session_state.ai_settings.get("cross_weight", 0.90)
+            if name == "Cross Multiply"
+            else st.session_state.ai_settings.get("formula_weight", 1.00)
+        )
+
+        exact_count = 0
+        position_hits = 0
+        any_digit_hits = 0
+        valid = 0
+
+        for i in range(1, len(history)):
+            base_draw = history[i - 1]
+            target_draw = history[i]
+            base_number = base_draw["first"]
+            actual = safe_digits(target_draw["back2"]).zfill(2)[-2:]
+            prediction = dynamic_formula_wrapper(
+                func, base_number, "back2", daily_number
+            )
+
+            pos_hit = sum(prediction[j] == actual[j] for j in range(2))
+            any_hit, _ = calculate_digit_accuracy(prediction, actual)
+            exact = prediction == actual
+
+            valid += 1
+            exact_count += int(exact)
+            position_hits += pos_hit
+            any_digit_hits += any_hit
+
+            test_rows.append({
+                "Formula": name,
+                "Base Date": base_draw["date"],
+                "Target Date": target_draw["date"],
+                "Base First Prize": base_number,
+                "Prediction": prediction,
+                "Actual Back2": actual,
+                "Exact Match": "Yes" if exact else "No",
+                "Correct Positions": pos_hit,
+                "Any Digit Hits": any_hit,
+            })
+
+        exact_rate = (exact_count / valid * 100) if valid else 0.0
+        position_rate = (position_hits / (valid * 2) * 100) if valid else 0.0
+        any_rate = (any_digit_hits / (valid * 2) * 100) if valid else 0.0
+        raw_score = position_hits * 50
+        weighted_score = raw_score * weight
+
+        rows.append({
+            "Formula": name,
+            "Tests": valid,
+            "Exact Hits": exact_count,
+            "Exact Match (%)": round(exact_rate, 2),
+            "Correct Positions": position_hits,
+            "Position Accuracy (%)": round(position_rate, 2),
+            "Any Digit Hits": any_digit_hits,
+            "Any Digit Rate (%)": round(any_rate, 2),
+            "Raw Score": round(raw_score, 2),
+            "Weight": weight,
+            "Weighted Score": round(weighted_score, 2),
+        })
+
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        summary = summary.sort_values(
+            by=["Exact Match (%)", "Position Accuracy (%)", "Weighted Score"],
+            ascending=False
+        ).reset_index(drop=True)
+        summary.insert(0, "Rank", range(1, len(summary) + 1))
+
+    details = pd.DataFrame(test_rows)
+    return summary, details, len(history) - 1
+# ==========================================
+# 5. STREAMLIT SIDEBAR
+# ==========================================
+st.sidebar.title("🧠 MENU CONTROL")
+menu = st.sidebar.radio(
+    "เลือกหน้าเมนู:",
+    [
+        "8. All-in-One Master Report",
+        "1. เพิ่ม/จัดการประวัติหวย",
+        "10. รันระบบทดสอบย้อนหลัง (Backtest)",
+        "9. ตั้งค่าน้ำหนัก AI (Settings)",
+    ]
+)
+
+# ==========================================
+# 6. ALL-IN-ONE MASTER REPORT
+# ==========================================
+if menu == "8. All-in-One Master Report":
+    st.title("🏆 ALL-IN-ONE MASTER REPORT")
+    st.caption(f"เวอร์ชัน: {VERSION}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        day_choice = st.selectbox("📅 เลือกวันทำนายงวดถัดไป:", DAYS)
+        daily_number = DAILY_NUMBERS[day_choice]
+        # วันทำนายเลือก Daily Number และสถิติเท่านั้น ไม่เปลี่ยนเลขฐาน
+        st.session_state.history = load_history_by_day(day_choice)
+
+    with col2:
+        target_number = st.text_input(
+            "📌 เลขฐาน 6 หลักงวดล่าสุด:",
+            max_chars=6,
+            key="target_number_input"
+        )
+        st.session_state.target_number = target_number
+
+    if len(target_number) != 6 or not target_number.isdigit():
+        st.error("กรุณากรอกเลขฐาน 6 หลักให้ถูกต้อง")
+    else:
+        if st.button("🚀 ประมวลผล Master Report", type="primary", use_container_width=True):
+            formula_rows, frequency, frequency_total = analyse_all_15_formulas(
+                target_number, daily_number, mode="back2"
+            )
+            frequency_counts = dict(frequency)
+            top_digits = [digit for digit, _ in frequency]
+            top_6 = top_digits[:6]
+            remaining = top_digits[6:]
+
+            st.markdown(
+                f"""
+                <div style="background:#f8fafc;padding:12px 16px;border-radius:8px;
+                border:1px solid #dbe4ef;margin-bottom:15px;font-weight:600;color:#1e293b;">
+                วันทำนาย: {day_choice} | เลขฐาน: {target_number} |
+                Daily Number: {daily_number} | จำนวนสูตร: 15 |
+                จำนวนหลัก: {frequency_total}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            cols = st.columns([1, 1, 1, 1, 1, 1, 1.25])
+            for i, digit in enumerate(top_6):
+                with cols[i]:
+                    st.metric(f"อันดับ {i + 1}", digit, f"{frequency_counts[digit]} ครั้ง")
+            with cols[6]:
+                st.write("**เลขที่เหลือ**")
+                st.write(" | ".join(
+                    f"{d} = {frequency_counts[d]} ครั้ง" for d in remaining
+                ))
+
+            st.subheader("ชุดเลขเด่นจากความถี่รวม 15 สูตร")
+            set_cols = st.columns(4)
+            set_specs = [
+                ("ชุด 5 ตัว", top_digits[:5]),
+                ("ชุด 4 ตัว", top_digits[:4]),
+                ("ชุด 3 ตัว", top_digits[:3]),
+                ("ชุด 2 ตัว", top_digits[:2]),
+            ]
+            for col, (label, digits) in zip(set_cols, set_specs):
+                with col:
+                    st.markdown(f"**{label}**")
+                    st.markdown(f"### {' '.join(digits)}")
+                    st.caption(" | ".join(
+                        f"{d}:{frequency_counts[d]}" for d in digits
+                    ))
+
+            with st.expander("🔍 ดูผลลัพธ์แยกตามสูตรทั้ง 15 สูตร", expanded=True):
+                st.subheader("15 FORMULA PREDICTION RESULTS")
+                df_formula_detail = pd.DataFrame(
+                    build_formula_detail_rows(target_number, daily_number)
+                )
+                st.dataframe(
+                    df_formula_detail,
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.caption(
+                    "Raw = คำนวณจากเลขฐานโดยไม่ผสม Daily Number | "
+                    "Blended = คำนวณหลังผสม Daily Number | "
+                    "Back2 = 2 หลักท้ายของ Blended"
+                )
+
+# ==========================================
+# 7. MANAGEMENT HISTORY PAGE
+# ==========================================
+elif menu == "1. เพิ่ม/จัดการประวัติหวย":
+    st.title("📚 เพิ่มและจัดการประวัติหวยรายวัน")
+    day_upload = st.selectbox("เลือกวันสำหรับจัดการประวัติ:", DAYS)
+
+    with st.expander("➕ เพิ่มข้อมูลงวดล่าสุดด้วยตนเอง (ไม่ต้องอัปโหลด CSV)", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            input_date = st.text_input("วันที่ (พ.ศ.) DD/MM/YYYY", key="manual_date")
+        with c2:
+            input_first = st.text_input("รางวัลที่ 1 (6 หลัก)", max_chars=6, key="manual_first")
+        with c3:
+            input_back2 = st.text_input("เลขท้าย 2 ตัว", max_chars=2, key="manual_back2")
+
+        if st.button("💾 บันทึกข้อมูลงวดใหม่"):
+            date_ok = bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}", input_date.strip()))
+            if not date_ok:
+                st.error("กรุณากรอกวันที่รูปแบบ DD/MM/YYYY")
+            elif len(input_first) != 6 or not input_first.isdigit():
+                st.error("รางวัลที่ 1 ต้องเป็นตัวเลข 6 หลัก")
+            elif len(input_back2) != 2 or not input_back2.isdigit():
+                st.error("เลขท้าย 2 ตัวต้องเป็นตัวเลข 2 หลัก")
+            else:
+                try:
+                    save_history_entry(
+                        day_upload, input_date.strip(), input_first, input_back2
+                    )
+                    st.success("บันทึกลง CSV สำเร็จ")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"บันทึกไม่สำเร็จ: {exc}")
+
+    st.divider()
+    uploaded_file = st.file_uploader(
+        f"📂 หรืออัปโหลด CSV สำหรับ {day_upload}",
+        type=["csv"],
+        key=f"upload_{day_upload}"
+    )
+    if uploaded_file is not None:
+        try:
+            uploaded_df = pd.read_csv(
+                uploaded_file, dtype=str, keep_default_na=False
+            )
+            st.session_state.uploaded_csvs[day_upload] = uploaded_df
+            st.success("โหลด CSV เข้าสู่ Session สำเร็จ")
+        except Exception as exc:
+            st.error(f"อ่าน CSV ไม่สำเร็จ: {exc}")
+
+    current_history = load_history_by_day(day_upload)
+    if current_history:
+        st.subheader(f"📋 ประวัติวัน {day_upload} ({len(current_history)} งวด)")
+        st.dataframe(
+            pd.DataFrame(current_history),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info(f"ยังไม่มีประวัติของวัน {day_upload}")
+
+# ==========================================
+# 8. COMPLETE BACKTEST ENGINE
+# ==========================================
+elif menu == "10. รันระบบทดสอบย้อนหลัง (Backtest)":
+    st.title("📈 ระบบทดสอบย้อนหลัง (Backtest Engine)")
+    st.caption(
+        "ทดสอบทุกสูตรแบบ Walk-forward โดยใช้ผลรางวัลที่ 1 ของงวดก่อนหน้า "
+        "ทำนายเลขท้าย 2 ตัวของงวดถัดไป"
+    )
+
+    backtest_day = st.selectbox("📅 เลือกวันสำหรับ Backtest:", DAYS, key="backtest_day")
+    history = load_history_by_day(backtest_day)
+    daily_number = DAILY_NUMBERS[backtest_day]
+
+    st.info(
+        f"วันทดสอบ: {backtest_day} | จำนวนประวัติ: {len(history)} งวด | "
+        f"Daily Number: {daily_number}"
+    )
+
+    if st.button("🚀 รัน Backtest ทั้งหมด", type="primary", use_container_width=True):
+        if len(history) < 2:
+            st.warning("ต้องมีข้อมูลอย่างน้อย 2 งวด จึงจะทดสอบย้อนหลังได้")
+        else:
+            summary, details, test_count = run_backtest_analysis(
+                backtest_day, history, daily_number
+            )
+
+            st.success(f"Backtest เสร็จสิ้น: ทดสอบ {test_count} คู่ข้อมูล")
+
+            st.subheader(f"🏆 TOP 3 FORMULA — {backtest_day}")
+            top3 = summary.head(3)
+            top_cols = st.columns(3)
+            for col, (_, item) in zip(top_cols, top3.iterrows()):
+                with col:
+                    st.metric(
+                        label=f"อันดับ {int(item['Rank'])}: {item['Formula']}",
+                        value=f"{item['Exact Match (%)']:.2f}%",
+                        delta=f"ตรงตำแหน่ง {item['Position Accuracy (%)']:.2f}%"
+                    )
+                    st.caption(
+                        f"Weighted Score: {item['Weighted Score']:.2f}"
+                    )
+
+            st.subheader("📊 ตารางคะแนนและความแม่นยำแยกรายสูตร")
+            st.dataframe(
+                summary,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader("📈 เปรียบเทียบ Exact Match (%)")
+            chart = summary.set_index("Formula")[["Exact Match (%)"]]
+            st.bar_chart(chart)
+
+            with st.expander("🔎 ดูผลทดสอบรายงวดของทุกสูตร", expanded=False):
+                selected_formula = st.selectbox(
+                    "เลือกสูตรเพื่อดูผลรายงวด:",
+                    summary["Formula"].tolist(),
+                    key="detail_formula"
+                )
+                formula_detail = details[
+                    details["Formula"] == selected_formula
+                ].copy()
+                st.dataframe(
+                    formula_detail,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            with st.expander("📥 ดาวน์โหลดรายงาน Backtest"):
+                csv_summary = summary.to_csv(index=False).encode("utf-8-sig")
+                csv_details = details.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "ดาวน์โหลดสรุปผลทุกสูตร CSV",
+                    csv_summary,
+                    file_name=f"backtest_{backtest_day}_summary.csv",
+                    mime="text/csv"
+                )
+                st.download_button(
+                    "ดาวน์โหลดผลทดสอบรายงวด CSV",
+                    csv_details,
+                    file_name=f"backtest_{backtest_day}_details.csv",
+                    mime="text/csv"
+                )
+
+# ==========================================
+# 9. SETTINGS PAGE
+# ==========================================
+elif menu == "9. ตั้งค่าน้ำหนัก AI (Settings)":
+    st.title("⚙️ ตั้งค่าน้ำหนัก AI (Weight Settings)")
+    st.caption("น้ำหนักมีผลต่อคะแนนถ่วงน้ำหนักและการจัดอันดับเมื่อคะแนนหลักเท่ากัน")
+
+    w_f = st.slider(
+        "Formula Weight", 0.1, 2.0,
+        float(st.session_state.ai_settings["formula_weight"]), 0.05
+    )
+    w_c = st.slider(
+        "Cross Weight", 0.1, 2.0,
+        float(st.session_state.ai_settings["cross_weight"]), 0.05
+    )
+
+    if st.button("💾 บันทึกค่าน้ำหนัก"):
+        st.session_state.ai_settings["formula_weight"] = w_f
+        st.session_state.ai_settings["cross_weight"] = w_c
+        st.success("บันทึกค่าน้ำหนักเรียบร้อย")
